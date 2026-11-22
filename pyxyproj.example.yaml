@@ -1,0 +1,55 @@
+# PyxyProj configuration
+# Read in this order (later wins):
+#   ~/.config/pyxyproj/config.yaml  ->  ./pyxyproj.yaml  (or --config FILE only)
+
+defaults:
+  preset: node          # see `pyxyproj presets`
+  language: null        # null = first language of the preset (js, ts, py, c, go, rust, html)
+  output_dir: .         # folder new projects are created in
+  author: ""
+  license: MIT          # MIT also writes a LICENSE file; other values are only recorded in manifests
+  description: ""
+  port: 3000
+  git: true             # run `git init`
+  install: false        # run the preset's install step (npm install, go mod tidy, ...)
+
+paths:                  # all relative to the new project root
+  public_dir: public    # static files; index.html is created here (empty for the node preset)
+  src_dir: .            # node/js: where server.js and routes.js live
+  ts_src_dir: src       # node/ts: where server.ts and routes.ts live
+  out_dir: dist         # node/ts: compiled output
+  server_file: server   # base file names, the extension follows the language
+  routes_file: routes
+
+options:                # per-preset option defaults
+  node:
+    framework: express  # express | http  (http = zero dependencies)
+
+files:                  # extras every project gets
+  readme: true
+  gitignore: true
+  license: true
+  editorconfig: false
+
+hooks:
+  post: []              # shell commands run inside the new project; {{name}} {{slug}} {{lang}} work
+  # post:
+  #   - code .
+
+# Custom presets. `extends` starts from a built-in preset; `files` entries are
+# rendered with {{name}} {{slug}} {{pkg}} {{port}} {{author}} {{year}} {{lang}}
+# {{public_dir}} ... and a `null` value removes a file the base preset made.
+#
+# presets:
+#   my-api:
+#     description: Express API with tests
+#     extends: node
+#     dirs: [tests, docs]
+#     files:
+#       tests/health.test.js: |
+#         // tests for {{name}}
+#       .env.example: |
+#         PORT={{port}}
+#       public/index.html: null
+#     install: npm install
+#     next: [npm install, npm run dev]
