@@ -6,6 +6,7 @@ defaults:
   preset: node          # see `pyxyproj presets`
   language: null        # null = first language of the preset (js, ts, py, c, go, rust, html)
   output_dir: .         # folder new projects are created in
+  location: null        # or: the name of a saved location (see `locations` below)
   author: ""
   license: MIT          # MIT also writes a LICENSE file; other values are only recorded in manifests
   description: ""
@@ -35,6 +36,18 @@ hooks:
   post: []              # shell commands run inside the new project; {{name}} {{slug}} {{lang}} work
   # post:
   #   - code .
+
+# Selectable default locations: left/right on "Location" in the TUI, `new -L NAME` on the CLI.
+# Also manageable with `pyxyproj locations add NAME PATH` (those are kept in a separate file).
+locations:
+  # work: ~/code
+  # play: ~/sandbox
+  # clients: /srv/clients
+
+history:                # `pyxyproj history`, and H in the TUI
+  enabled: true
+  limit: 500            # newest entries kept; 0 = unlimited
+  file: null            # null = ~/.local/share/pyxyproj/history.json
 
 # Custom presets. `extends` starts from a built-in preset; `files` entries are
 # rendered with {{name}} {{slug}} {{pkg}} {{port}} {{author}} {{year}} {{lang}}

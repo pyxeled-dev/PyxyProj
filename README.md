@@ -22,12 +22,18 @@ pyxyproj new tool -l python       # language picks a matching preset
 pyxyproj new site -p static
 pyxyproj new my-app -n            # dry run: show the file tree only
 pyxyproj presets [-l go]          # list presets / filter by language
+pyxyproj new my-app -L work       # create it in a saved location
+pyxyproj locations                # list saved locations
+pyxyproj locations add work ~/code
+pyxyproj locations remove work
+pyxyproj history                  # everything pyxyproj has generated
 pyxyproj config init [--global]   # write a starter pyxyproj.yaml
 pyxyproj config show | path
 ```
 
 `new` flags: `-p` preset, `-l` language, `-d` parent folder, `-o KEY=VALUE`, `--port`,
 `--author`, `--license`, `--description`, `--git/--no-git`, `--install/--no-install`,
+`-L NAME` saved location (instead of `-d`), `--no-history`,
 `-f` write into a non-empty folder, `-n` dry run, `-q` quiet.
 `pyxyproj new .` scaffolds into the current folder.
 
@@ -46,6 +52,51 @@ Every project also gets `README.md`, `.gitignore`, and a `LICENSE` (MIT) unless 
 
 Node scripts: JS uses `node server.js` / `node --watch server.js`. TS uses `tsx watch` for
 `dev`, and `start` builds with `tsc` then runs `dist/`.
+
+## Locations
+
+A list of folders you create projects in often. Add them three ways:
+
+```yaml
+# pyxyproj.yaml (mapping name: path, or just a list of paths)
+locations:
+  work: ~/code
+  play: ~/sandbox
+defaults:
+  location: work        # optional: use this one unless -d / -L is given
+```
+
+```sh
+pyxyproj locations add work ~/code     # saved in ~/.config/pyxyproj/locations.yaml
+pyxyproj new my-app -L work
+```
+
+In the TUI, `←/→` on **Location** cycles through `here` plus every saved location.
+`a` saves the current path under a name, `x` forgets a saved one (config-defined
+locations are read-only there). Resolution order: `-d` > `-L` > `defaults.location` > `defaults.output_dir`.
+
+## History
+
+Every project pyxyproj creates is recorded in `~/.local/share/pyxyproj/history.json`
+(name, path, preset, language, options, port, time). Dry runs are not recorded.
+
+```sh
+pyxyproj history                 # newest first; folders that were deleted are marked (missing)
+pyxyproj history -n 5 --json
+pyxyproj history --missing       # only entries whose folder is gone
+pyxyproj history --prune         # forget those entries
+pyxyproj history --clear         # forget everything (never deletes project folders)
+```
+
+In the TUI press `H` for the same list. `Enter` copies that project's preset, language,
+options, port and parent folder into the form, which is handy for "another one like that".
+`x` forgets an entry. Turn it off with `history.enabled: false`, or per run with `--no-history`.
+
+## Tab completion (TUI)
+
+While editing a path (Location): `Tab` completes folders (common prefix first, `~` works),
+`Tab` again cycles through the candidates, `Ctrl-W` removes the last path component,
+`Ctrl-U` clears. In your normal shell, paths such as `-d` are already completed by the shell.
 
 ## Config
 
@@ -86,8 +137,10 @@ Template variables: `{{name}} {{slug}} {{pkg}} {{lang}} {{port}} {{author}} {{li
 
 ## TUI keys
 
-`↑/↓` or `j/k` move, `←/→` or `h/l` change a choice, `Enter` edits text / toggles,
-`g` generates, `q` or `Esc` quits. A live file-tree preview updates as you change fields.
+`↑/↓` or `j/k` move, `←/→` or `h/l` change a choice or cycle saved locations,
+`Enter` edits text / toggles, `g` generates, `H` opens history, `q` or `Esc` quits.
+On Location: `a` saves it, `x` forgets it. A live file-tree preview updates as you change fields.
+The terminal needs to be at least 44x20.
 
 ## Adding a built-in preset
 

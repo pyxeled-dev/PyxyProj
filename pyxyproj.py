@@ -8,6 +8,9 @@ built-in YAML-subset reader takes over). Python 3.9+.
     pyxyproj new my-app              Node.js project (default preset)
     pyxyproj new my-app -l ts        TypeScript variant
     pyxyproj new tool -p python      another preset
+    pyxyproj new my-app -L work      create it in a saved location
+    pyxyproj locations add work ~/code
+    pyxyproj history                 projects generated so far
     pyxyproj presets                 list presets and languages
     pyxyproj config init             write a starter pyxyproj.yaml
 """
@@ -294,6 +297,7 @@ DEFAULT_CONFIG: dict = {
         "preset": "node",
         "language": None,
         "output_dir": ".",
+        "location": None,
         "author": "",
         "license": "MIT",
         "description": "",
@@ -312,6 +316,8 @@ DEFAULT_CONFIG: dict = {
     "options": {"node": {"framework": "express"}},
     "files": {"readme": True, "gitignore": True, "license": True, "editorconfig": False},
     "hooks": {"post": []},
+    "locations": {},
+    "history": {"enabled": True, "limit": 500, "file": None},
     "presets": {},
 }
 
@@ -324,6 +330,7 @@ defaults:
   preset: node          # see `pyxyproj presets`
   language: null        # null = first language of the preset (js, ts, py, c, go, rust, html)
   output_dir: .         # folder new projects are created in
+  location: null        # or: the name of a saved location (see `locations` below)
   author: ""
   license: MIT          # MIT also writes a LICENSE file; other values are only recorded in manifests
   description: ""
@@ -353,6 +360,18 @@ hooks:
   post: []              # shell commands run inside the new project; {{name}} {{slug}} {{lang}} work
   # post:
   #   - code .
+
+# Selectable default locations: left/right on "Location" in the TUI, `new -L NAME` on the CLI.
+# Also manageable with `pyxyproj locations add NAME PATH` (those are kept in a separate file).
+locations:
+  # work: ~/code
+  # play: ~/sandbox
+  # clients: /srv/clients
+
+history:                # `pyxyproj history`, and H in the TUI
+  enabled: true
+  limit: 500            # newest entries kept; 0 = unlimited
+  file: null            # null = ~/.local/share/pyxyproj/history.json
 
 # Custom presets. `extends` starts from a built-in preset; `files` entries are
 # rendered with {{name}} {{slug}} {{pkg}} {{port}} {{author}} {{year}} {{lang}}
@@ -421,12 +440,16 @@ def load_config(explicit: Optional[str] = None):
             raise PyxyError(f"{f}: top level must be a mapping")
         cfg = deep_merge(cfg, data)
         sources.append(f)
-    for section in ("defaults", "paths", "options", "files", "hooks", "presets"):
+    for section in ("defaults", "paths", "options", "files", "hooks", "history", "presets"):
         if not isinstance(cfg.get(section), dict):
             if cfg.get(section) is None:
                 cfg[section] = {}
             else:
                 raise PyxyError(f"config section '{section}' must be a mapping")
+    if cfg.get("locations") is None:
+        cfg["locations"] = {}
+    if not isinstance(cfg["locations"], (dict, list)):
+        raise PyxyError("config section 'locations' must be a mapping (name: path) or a list of paths")
     for k in ("public_dir", "src_dir", "ts_src_dir", "out_dir"):
         cfg["paths"][k] = safe_rel(cfg["paths"][k], f"paths.{k}")
     for k in ("server_file", "routes_file"):
@@ -435,6 +458,188 @@ def load_config(explicit: Optional[str] = None):
     if not isinstance(cfg["hooks"].get("post") or [], list):
         raise PyxyError("hooks.post must be a list of commands")
     return cfg, sources
+
+
+# --------------------------------------------------------------------------- #
+# Saved locations and project history
+# --------------------------------------------------------------------------- #
+
+def short_path(p) -> str:
+    p = str(p)
+    home = str(Path.home())
+    if p == home:
+        return "~"
+    if p.startswith(home + os.sep):
+        return "~" + p[len(home):]
+    return p
+
+
+def fit(text: str, n: int) -> str:
+    """Trim from the left so the interesting end of a path stays visible."""
+    if n <= 1 or len(text) <= n:
+        return text
+    return ("…" if _utf() else "~") + text[-(n - 1):]
+
+
+def same_path(a, b) -> bool:
+    def norm(p):
+        return os.path.normpath(os.path.abspath(os.path.expanduser(str(p))))
+    return norm(a) == norm(b)
+
+
+def data_dir() -> Path:
+    root = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+    return Path(root) / APP
+
+
+def locations_file() -> Path:
+    return user_config_path().parent / "locations.yaml"
+
+
+LOC_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _norm_locations(raw, source: str) -> list:
+    out = []
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if v not in (None, ""):
+                out.append((str(k), str(v), source))
+    elif isinstance(raw, list):
+        for v in raw:
+            p = str(v)
+            name = Path(os.path.expanduser(p)).name or p
+            out.append((name, p, source))
+    elif raw:
+        raise PyxyError("'locations' must be a mapping (name: path) or a list of paths")
+    return out
+
+
+def load_saved_locations() -> dict:
+    f = locations_file()
+    if not f.is_file():
+        return {}
+    try:
+        data = load_yaml(f.read_text(encoding="utf-8"))
+    except PyxyError as exc:
+        raise PyxyError(f"{f}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise PyxyError(f"{f}: expected 'name: path' pairs")
+    return {str(k): str(v) for k, v in data.items() if v}
+
+
+def write_saved_locations(data: dict) -> None:
+    f = locations_file()
+    f.parent.mkdir(parents=True, exist_ok=True)
+    head = "# Managed by pyxyproj (`pyxyproj locations`, TUI). Hand-written ones can live in your config.\n"
+    f.write_text(head + (dump_yaml(data) + "\n" if data else ""), encoding="utf-8")
+
+
+def all_locations(cfg: dict) -> list:
+    """[(name, path, source)] - config entries first, then saved ones."""
+    seen, out = set(), []
+    for name, path, src in _norm_locations(cfg.get("locations"), "config") + \
+            _norm_locations(load_saved_locations(), "saved"):
+        if name not in seen:
+            seen.add(name)
+            out.append((name, path, src))
+    return out
+
+
+def resolve_location(cfg: dict, name: str) -> str:
+    if name == "here":
+        return "."
+    for n, p, _ in all_locations(cfg):
+        if n == name:
+            return p
+    known = ", ".join(["here"] + [n for n, _, _ in all_locations(cfg)])
+    raise PyxyError(f"unknown location '{name}' (available: {known})")
+
+
+def default_parent(cfg: dict) -> str:
+    d = cfg["defaults"]
+    if d.get("location"):
+        return resolve_location(cfg, str(d["location"]))
+    return str(d.get("output_dir", "."))
+
+
+def add_saved_location(cfg: dict, name: str, path) -> str:
+    name = (name or "").strip()
+    if not LOC_NAME.match(name):
+        raise PyxyError("location names may only use letters, digits, '.', '_' and '-'")
+    if name == "here":
+        raise PyxyError("'here' is reserved (it means the current folder)")
+    if any(n == name and s == "config" for n, _, s in all_locations(cfg)):
+        raise PyxyError(f"'{name}' is defined in your config file; choose another name")
+    resolved = Path(os.path.expanduser(str(path or "."))).resolve()
+    saved = load_saved_locations()
+    saved[name] = short_path(resolved)
+    write_saved_locations(saved)
+    return saved[name]
+
+
+def remove_saved_location(cfg: dict, name: str) -> None:
+    saved = load_saved_locations()
+    if name in saved:
+        del saved[name]
+        write_saved_locations(saved)
+        return
+    if any(n == name for n, _, _ in all_locations(cfg)):
+        raise PyxyError(f"'{name}' comes from your config file - remove it there")
+    raise PyxyError(f"unknown location '{name}'")
+
+
+def history_path(cfg: dict) -> Path:
+    custom = (cfg.get("history") or {}).get("file")
+    return Path(os.path.expanduser(str(custom))) if custom else data_dir() / "history.json"
+
+
+def load_history(cfg: dict) -> list:
+    """Newest first. A corrupt file is moved aside instead of being overwritten."""
+    f = history_path(cfg)
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        entries = data.get("projects", []) if isinstance(data, dict) else []
+        return [e for e in entries if isinstance(e, dict) and e.get("path")]
+    except (OSError, ValueError):
+        try:
+            f.replace(f.with_suffix(".json.bak"))
+        except OSError:
+            pass
+        return []
+
+
+def save_history(cfg: dict, entries: list) -> None:
+    f = history_path(cfg)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"version": 1, "projects": entries}, indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, f)
+
+
+def record_history(cfg: dict, plan: "Plan") -> None:
+    conf = cfg.get("history") or {}
+    if not conf.get("enabled", True):
+        return
+    try:
+        path = str(plan.root)
+        entries = [e for e in load_history(cfg) if e.get("path") != path]
+        entries.insert(0, {
+            "name": plan.name, "path": path, "preset": plan.preset.key, "lang": plan.lang,
+            "opts": plan.opts, "port": plan.ctx.get("port"),
+            "created": datetime.datetime.now().isoformat(timespec="seconds"), "version": __version__,
+        })
+        limit = int(conf.get("limit") or 0)
+        save_history(cfg, entries[:limit] if limit > 0 else entries)
+    except (OSError, ValueError):
+        pass  # history is a convenience; never fail a generation because of it
+
+
+def forget_history(cfg: dict, path: str) -> None:
+    save_history(cfg, [e for e in load_history(cfg) if e.get("path") != path])
 
 
 # --------------------------------------------------------------------------- #
@@ -1214,7 +1419,7 @@ def _run(cmd, cwd: Path, shell: bool = False) -> bool:
 
 
 def execute_plan(cfg: dict, plan: Plan, *, git: bool, install: bool, force: bool = False,
-                 dry_run: bool = False, quiet: bool = False) -> None:
+                 dry_run: bool = False, quiet: bool = False, record: bool = True) -> None:
     root, g = plan.root, glyphs()
     say = (lambda *a, **k: None) if quiet else print
     if root.exists() and not root.is_dir():
@@ -1244,6 +1449,8 @@ def execute_plan(cfg: dict, plan: Plan, *, git: bool, install: bool, force: bool
             raise PyxyError(f"refusing to write outside the project: {rel}")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+    if record:
+        record_history(cfg, plan)
 
     say(f"\n{paint('32;1', g['ok'])} Created {paint('1', plan.name)}  ({tag})")
     say(paint("2", f"  {g['arrow']} {root}"))
@@ -1287,6 +1494,31 @@ def execute_plan(cfg: dict, plan: Plan, *, git: bool, install: bool, force: bool
 # TUI (curses)
 # --------------------------------------------------------------------------- #
 
+def complete_path(text: str):
+    """Directory tab-completion. Returns (new_text, candidates, head)."""
+    if text == "~":
+        return "~/", [], "~/"
+    if "/" in text:
+        head, tail = text.rsplit("/", 1)
+        head += "/"
+    else:
+        head, tail = "", text
+    base = os.path.expanduser(head) if head else "."
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return text, [], head
+    hidden = tail.startswith(".")
+    cands = [n for n in names
+             if n.startswith(tail) and (hidden or not n.startswith("."))
+             and os.path.isdir(os.path.join(base, n))]
+    if not cands:
+        return text, [], head
+    if len(cands) == 1:
+        return head + cands[0] + "/", cands, head
+    return head + os.path.commonprefix(cands), cands, head
+
+
 def run_tui(cfg: dict):
     """Interactive form. Returns a dict of answers, or None if cancelled."""
     try:
@@ -1301,10 +1533,14 @@ def run_tui(cfg: dict):
 
 def _tui(scr, curses, cfg, presets):
     d = cfg["defaults"]
-    g = glyphs()
     uni = _utf()
     left, right = ("‹ ", " ›") if uni else ("< ", " >")
     mark = "▸" if uni else ">"
+    cursor = "█" if uni else "_"
+    ell = "…" if uni else "..."
+    dot = glyphs()["dot"]
+    ud = "↑↓" if uni else "up/down"
+    lr = "←→" if uni else "left/right"
 
     try:
         curses.curs_set(0)
@@ -1327,9 +1563,15 @@ def _tui(scr, curses, cfg, presets):
                      err=curses.color_pair(3) | curses.A_BOLD, hi=curses.color_pair(4) | curses.A_BOLD)
 
     st = {"preset": d.get("preset") if d.get("preset") in presets else next(iter(presets)),
-          "language": None, "name": "my-project", "dir": str(d.get("output_dir", ".")),
+          "language": None, "name": "my-project", "dir": default_parent(cfg),
           "port": str(d.get("port", 3000)), "git": bool(d.get("git", True)),
           "install": bool(d.get("install", False)), "opts": {}}
+    loc_list: list = []
+
+    def refresh_locs():
+        loc_list[:] = [("here", ".")] + [(n, p) for n, p, _ in all_locations(cfg)]
+
+    refresh_locs()
 
     def set_preset(key):
         st["preset"] = key
@@ -1346,7 +1588,7 @@ def _tui(scr, curses, cfg, presets):
         fl = [dict(id="preset", label="Preset", kind="choice", values=list(presets)),
               dict(id="language", label="Language", kind="choice", values=p.languages),
               dict(id="name", label="Name", kind="text"),
-              dict(id="dir", label="Location", kind="text")]
+              dict(id="dir", label="Location", kind="location")]
         for opt, vals in p.options.items():
             fl.append(dict(id="opt:" + opt, label=opt.capitalize(), kind="choice", values=vals))
         if p.takes_port:
@@ -1369,6 +1611,12 @@ def _tui(scr, curses, cfg, presets):
         else:
             st[f["id"]] = v
 
+    def loc_name():
+        for n, p in loc_list:
+            if same_path(p, st["dir"]):
+                return n
+        return None
+
     def show(f):
         v = val(f)
         if f["kind"] == "toggle":
@@ -1376,26 +1624,102 @@ def _tui(scr, curses, cfg, presets):
         if f["kind"] == "choice":
             label = LANGS.get(v, v) if f["id"] == "language" else str(v)
             return f"{left}{label}{right}"
+        if f["kind"] == "location":
+            n = loc_name()
+            p = "." if v == "." else short_path(v)
+            return f"{left}{n}{right} {p}" if n else p
         return str(v)
 
     def try_plan():
         try:
-            p = make_plan(cfg, name=st["name"] or "project", parent=st["dir"] or ".", preset=st["preset"],
-                          lang=st["language"], opts=st["opts"], port=st["port"])
-            return p, None
+            return make_plan(cfg, name=st["name"] or "project", parent=st["dir"] or ".", preset=st["preset"],
+                             lang=st["language"], opts=st["opts"], port=st["port"]), None
         except PyxyError as exc:
             return None, str(exc)
 
-    def put(y, x, text, attr=0):
+    def put(y, x, text, attr=0, maxw=None):
         h, w = scr.getmaxyx()
         if 0 <= y < h and 0 <= x < w - 1:
+            n = w - x - 1 if maxw is None else min(w - x - 1, maxw)
             try:
-                scr.addstr(y, x, text[: w - x - 1], attr)
+                scr.addstr(y, x, text[:n], attr)
             except curses.error:
                 pass
 
-    sel, editing, buf, msg, msg_kind, confirm = 0, False, "", "", "dim", None
-    LABEL_W, VALUE_X = 14, 18
+    def apply_entry(e):
+        key = e.get("preset")
+        if key not in presets:
+            return f"preset '{key}' no longer exists", "err"
+        set_preset(key)
+        p = presets[key]
+        if e.get("lang") in p.languages:
+            st["language"] = e["lang"]
+        for k, v in (e.get("opts") or {}).items():
+            if k in p.options and v in p.options[k]:
+                st["opts"][k] = v
+        if e.get("port"):
+            st["port"] = str(e["port"])
+        st["dir"] = short_path(Path(os.path.expanduser(e["path"])).parent)
+        return f"settings from {e.get('name', '?')} applied", "ok"
+
+    def history_view():
+        entries = load_history(cfg)
+        cur, top, note = 0, 0, ""
+        while True:
+            scr.erase()
+            h, w = scr.getmaxyx()
+            put(1, 2, "History", attrs["accent"])
+            put(1, 11, f"{len(entries)} project(s)", attrs["dim"])
+            put(2, 2, "-" * min(w - 4, 70), attrs["dim"])
+            rows = max(1, h - 7)
+            if not entries:
+                put(4, 2, "Nothing generated yet - projects you create show up here.", attrs["dim"])
+            cur = max(0, min(cur, len(entries) - 1)) if entries else 0
+            if cur < top:
+                top = cur
+            if cur >= top + rows:
+                top = cur - rows + 1
+            for r, e in enumerate(entries[top:top + rows]):
+                i = top + r
+                path = e.get("path", "")
+                exists = os.path.isdir(os.path.expanduser(path))
+                tag = f"{e.get('preset', '?')} {dot} {LANGS.get(e.get('lang'), e.get('lang', '?'))}"
+                line = (f"{str(e.get('created', ''))[:10]}  {str(e.get('name', '?')):<18.18}  "
+                        f"{tag:<26.26}  {short_path(path)}" + ("" if exists else "  (missing)"))
+                attr = attrs["sel"] if i == cur else (0 if exists else attrs["dim"])
+                put(4 + r, 2, line.ljust(max(0, w - 5)), attr, w - 4)
+            if note:
+                put(h - 3, 2, note, attrs["dim"])
+            put(h - 2, 2, f"{ud} move  enter apply its settings to the form  x forget  q back", attrs["dim"])
+            scr.refresh()
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            if ch == curses.KEY_RESIZE:
+                continue
+            note = ""
+            if ch in ("q", "Q", "H", "\x1b"):
+                return None
+            elif ch in (curses.KEY_UP, "k"):
+                cur -= 1
+            elif ch in (curses.KEY_DOWN, "j"):
+                cur += 1
+            elif ch in (curses.KEY_HOME, "g"):
+                cur = 0
+            elif ch in (curses.KEY_END, "G"):
+                cur = len(entries) - 1
+            elif ch in ("\n", "\r") or ch == curses.KEY_ENTER:
+                if entries:
+                    return entries[cur]
+            elif ch in ("x", "X") and entries:
+                forget_history(cfg, entries[cur].get("path", ""))
+                entries = load_history(cfg)
+                note = "forgotten (the folder itself was not touched)"
+
+    sel, edit, buf, tab = 0, None, "", None      # edit: None | "text" | "path" | "locname"
+    msg, msg_kind, confirm = "", "dim", None
+    LABEL_W, VALUE_X, PX = 14, 18, 56
 
     while True:
         fields = build_fields()
@@ -1410,6 +1734,8 @@ def _tui(scr, curses, cfg, presets):
                 return None
             continue
 
+        wide = w >= PX + 24
+        valw = (PX if wide else w) - VALUE_X - 2
         put(1, 2, "PyxyProj", attrs["accent"])
         put(1, 11, f"v{__version__}  project scaffolder", attrs["dim"])
         put(2, 2, "-" * min(w - 4, 70), attrs["dim"])
@@ -1420,38 +1746,54 @@ def _tui(scr, curses, cfg, presets):
             if f["kind"] == "button":
                 label = f"[ {f['label']} ]"
                 attr = attrs["sel"] if is_sel else (attrs["ok"] if f["id"] == "go" else attrs["dim"])
-                put(y + 1, 2, label, attr)   # +1 leaves a blank row above; go/quit are consecutive fields
+                put(y + 1, 2, label, attr)
                 continue
+            here = bool(edit) and is_sel
             put(y, 0, mark if is_sel else " ", attrs["accent"])
-            put(y, 2, f["label"].ljust(LABEL_W), attrs["hi"] if is_sel else 0)
-            if editing and is_sel:
-                put(y, VALUE_X, buf + ("█" if uni else "_"), attrs["accent"])
+            put(y, 2, ("Save as" if here and edit == "locname" else f["label"]).ljust(LABEL_W),
+                attrs["hi"] if is_sel else 0)
+            if here:
+                put(y, VALUE_X, fit(buf, valw - 1) + cursor, attrs["accent"], valw)
             else:
-                put(y, VALUE_X, show(f), attrs["accent"] if is_sel else 0)
+                put(y, VALUE_X, fit(show(f), valw), attrs["accent"] if is_sel else 0, valw)
 
         plan, err = try_plan()
-        px = 56
-        if w >= px + 24:
-            put(3, px, "Preview", attrs["hi"])
+        if wide:
+            put(3, PX, "Preview", attrs["hi"])
             if plan:
                 for j, line in enumerate(tree_lines(plan.name, plan.entries())):
-                    if 4 + j >= h - 3:
-                        put(4 + j, px, "…" if uni else "...", attrs["dim"])
+                    if 4 + j >= h - 6:
+                        put(4 + j, PX, ell, attrs["dim"])
                         break
-                    put(4 + j, px, line)
+                    put(4 + j, PX, line)
             else:
-                put(4, px, err or "", attrs["err"])
+                put(4, PX, err or "", attrs["err"])
         elif err and not msg:
             put(h - 3, 2, err, attrs["err"])
 
-        p = presets[st["preset"]]
-        put(h - 4, 2, p.description, attrs["dim"])
-        put(h - 3, 2, msg, attrs.get(msg_kind, 0)) if msg else None
-        if editing:
-            put(h - 2, 2, "type to edit  enter accept  esc cancel  ctrl-u clear", attrs["dim"])
+        if edit == "path" and tab and tab["cands"]:
+            put(h - 5, 2, "tab:", attrs["dim"])
+            x = 7
+            for i, c in enumerate(tab["cands"]):
+                label = c + "/"
+                if x + len(label) >= w - 3:
+                    put(h - 5, x, ell, attrs["dim"])
+                    break
+                put(h - 5, x, label, attrs["sel"] if i == tab["idx"] else attrs["accent"])
+                x += len(label) + 2
+
+        put(h - 4, 2, presets[st["preset"]].description, attrs["dim"])
+        if msg:
+            put(h - 3, 2, msg, attrs.get(msg_kind, 0))
+        if edit == "path":
+            hint = "type a path  tab complete (again: cycle)  ctrl-w up a level  enter accept  esc cancel"
+        elif edit:
+            hint = "type to edit  enter accept  esc cancel  ctrl-u clear"
+        elif fields[sel]["kind"] == "location":
+            hint = f"{lr} saved locations  enter edit path  a save this  x forget  H history  q quit"
         else:
-            put(h - 2, 2, "↑↓ move  ←→ change  enter edit/toggle  g generate  q quit" if uni
-                else "up/down move  left/right change  enter edit/toggle  g generate  q quit", attrs["dim"])
+            hint = f"{ud} move  {lr} change  enter edit/toggle  g generate  H history  q quit"
+        put(h - 2, 2, hint, attrs["dim"])
         scr.refresh()
 
         try:
@@ -1463,18 +1805,42 @@ def _tui(scr, curses, cfg, presets):
         f = fields[sel]
         msg = ""
 
-        if editing:
+        if edit:
             if ch in ("\n", "\r") or ch == curses.KEY_ENTER:
-                setval(f, buf.strip() if f["id"] != "name" else buf.strip())
-                editing = False
+                text = buf.strip()
+                if edit == "locname":
+                    try:
+                        add_saved_location(cfg, text, st["dir"])
+                        refresh_locs()
+                        msg, msg_kind = f"saved location '{text}'", "ok"
+                    except PyxyError as exc:
+                        msg, msg_kind = str(exc), "err"
+                else:
+                    setval(f, text)
+                edit, tab = None, None
             elif ch == "\x1b":
-                editing = False
+                edit, tab = None, None
+            elif ch == "\t":
+                if edit == "path":
+                    if tab and buf == tab["last"] and len(tab["cands"]) > 1:
+                        tab["idx"] = (tab["idx"] + 1) % len(tab["cands"])
+                        buf = tab["head"] + tab["cands"][tab["idx"]] + "/"
+                        tab["last"] = buf
+                    else:
+                        buf, cands, head = complete_path(buf)
+                        tab = {"cands": cands, "head": head, "idx": -1, "last": buf}
+                        if not cands:
+                            msg, msg_kind = "no matching folders", "dim"
             elif ch in ("\x7f", "\b") or ch == curses.KEY_BACKSPACE:
-                buf = buf[:-1]
+                buf, tab = buf[:-1], None
             elif ch == "\x15":
-                buf = ""
+                buf, tab = "", None
+            elif ch == "\x17":
+                stripped = buf.rstrip("/")
+                cut = stripped.rfind("/")
+                buf, tab = (stripped[:cut + 1] if cut >= 0 else ""), None
             elif isinstance(ch, str) and ch.isprintable():
-                buf += ch
+                buf, tab = buf + ch, None
             continue
 
         def cycle(step):
@@ -1485,6 +1851,11 @@ def _tui(scr, curses, cfg, presets):
                 setval(f, vals[(idx + step) % len(vals)])
             elif f["kind"] == "toggle":
                 setval(f, not val(f))
+            elif f["kind"] == "location":
+                paths = [p for _, p in loc_list]
+                idx = next((i for i, p in enumerate(paths) if same_path(p, st["dir"])), None)
+                idx = (0 if step > 0 else len(paths) - 1) if idx is None else (idx + step) % len(paths)
+                st["dir"] = paths[idx]
 
         def generate():
             nonlocal msg, msg_kind, confirm
@@ -1512,6 +1883,24 @@ def _tui(scr, curses, cfg, presets):
             cycle(-1)
         elif ch in (curses.KEY_RIGHT, "l"):
             cycle(1)
+        elif ch == "H":
+            entry = history_view()
+            if entry:
+                msg, msg_kind = apply_entry(entry)
+        elif ch == "a" and f["kind"] == "location":
+            edit, tab = "locname", None
+            buf = loc_name() or Path(os.path.expanduser(st["dir"])).resolve().name
+        elif ch in ("x", "X") and f["kind"] == "location":
+            n = loc_name()
+            if n is None or n == "here":
+                msg, msg_kind = "this folder is not a saved location", "dim"
+            else:
+                try:
+                    remove_saved_location(cfg, n)
+                    refresh_locs()
+                    msg, msg_kind = f"forgot location '{n}'", "ok"
+                except PyxyError as exc:
+                    msg, msg_kind = str(exc), "err"
         elif ch in ("g", "G"):
             res = generate()
             if res:
@@ -1520,7 +1909,9 @@ def _tui(scr, curses, cfg, presets):
             if f["kind"] in ("choice", "toggle"):
                 cycle(1)
             elif f["kind"] == "text":
-                editing, buf = True, str(val(f))
+                edit, buf, tab = "text", str(val(f)), None
+            elif f["kind"] == "location":
+                edit, buf, tab = "path", str(val(f)), None
             elif f["id"] == "go":
                 res = generate()
                 if res:
@@ -1535,11 +1926,12 @@ def _tui(scr, curses, cfg, presets):
 
 def cmd_new(cfg, a) -> int:
     d = cfg["defaults"]
-    plan = make_plan(cfg, name=a.name, parent=a.dir or d.get("output_dir", "."), preset=a.preset, lang=a.lang,
+    parent = a.dir or (resolve_location(cfg, a.loc) if a.loc else default_parent(cfg))
+    plan = make_plan(cfg, name=a.name, parent=parent, preset=a.preset, lang=a.lang,
                      opts=a.opt, port=a.port, author=a.author, license_=a.license, description=a.description)
     execute_plan(cfg, plan, git=d.get("git", True) if a.git is None else a.git,
                  install=d.get("install", False) if a.install is None else a.install,
-                 force=a.force, dry_run=a.dry_run, quiet=a.quiet)
+                 force=a.force, dry_run=a.dry_run, quiet=a.quiet, record=not a.no_history)
     return 0
 
 
@@ -1569,6 +1961,71 @@ def cmd_presets(cfg, a) -> int:
         mark = paint("35", " (custom)") if p.custom else ""
         print(f"  {paint('36;1', p.key.ljust(kw))}  {', '.join(p.languages).ljust(lw)}  {p.description}{mark}{opts}")
     print(paint("2", f"\ndefault preset: {cfg['defaults'].get('preset')}"))
+    return 0
+
+
+def _age_line(e: dict) -> str:
+    return str(e.get("created", ""))[:16].replace("T", " ")
+
+
+def cmd_history(cfg, a) -> int:
+    entries = load_history(cfg)
+    if a.clear:
+        save_history(cfg, [])
+        print(f"cleared {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}")
+        return 0
+    gone = [e for e in entries if not os.path.isdir(os.path.expanduser(e.get("path", "")))]
+    if a.prune:
+        save_history(cfg, [e for e in entries if e not in gone])
+        print(f"forgot {len(gone)} project(s) whose folder no longer exists")
+        return 0
+    shown = gone if a.missing else entries
+    if a.limit:
+        shown = shown[: a.limit]
+    if a.json:
+        print(json.dumps(shown, indent=2, ensure_ascii=False))
+        return 0
+    if not shown:
+        print("Nothing missing." if a.missing and entries else
+              "No projects recorded yet - ones you generate with pyxyproj will be listed here.")
+        return 0
+    dot = glyphs()["dot"]
+    nw = min(24, max(len(str(e.get("name", "?"))) for e in shown))
+    tags = [f"{e.get('preset', '?')} {dot} {LANGS.get(e.get('lang'), e.get('lang', '?'))}" for e in shown]
+    tw = max(len(t) for t in tags)
+    for e, tag in zip(shown, tags):
+        miss = e in gone
+        path = short_path(e.get("path", ""))
+        line = (f"  {paint('2', _age_line(e))}  {paint('36;1', str(e.get('name', '?')).ljust(nw))}  "
+                f"{tag.ljust(tw)}  {paint('2' if not miss else '31', path + ('  (missing)' if miss else ''))}")
+        print(line)
+    print(paint("2", f"\n{len(shown)} of {len(entries)} project(s)  {glyphs()['dot']}  {history_path(cfg)}"))
+    return 0
+
+
+def cmd_locations(cfg, a) -> int:
+    if a.action == "add":
+        if not a.name:
+            raise PyxyError("usage: pyxyproj locations add NAME [PATH]   (PATH defaults to the current folder)")
+        stored = add_saved_location(cfg, a.name, a.path)
+        print(f"{paint('32;1', glyphs()['ok'])} saved location {paint('1', a.name)} {glyphs()['arrow']} {stored}")
+        return 0
+    if a.action == "remove":
+        if not a.name:
+            raise PyxyError("usage: pyxyproj locations remove NAME")
+        remove_saved_location(cfg, a.name)
+        print(f"forgot location {a.name}")
+        return 0
+    rows = [("here", ".", "built-in")] + all_locations(cfg)
+    nw = max(len(r[0]) for r in rows)
+    for name, path, src in rows:
+        real = os.path.expanduser(path)
+        ok = os.path.isdir(real)
+        note = "" if ok or name == "here" else paint("33", "  (folder does not exist yet)")
+        print(f"  {paint('36;1', name.ljust(nw))}  {path.ljust(28)}  {paint('2', src)}{note}")
+    default = cfg["defaults"].get("location")
+    print(paint("2", f"\ndefault: {default if default else cfg['defaults'].get('output_dir', '.')}"
+                     f"  {glyphs()['dot']}  use with: pyxyproj new NAME -L <location>"))
     return 0
 
 
@@ -1606,7 +2063,9 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("name", help="project name or path (use '.' for the current folder)")
     n.add_argument("-p", "--preset", help="preset key (see `presets`)")
     n.add_argument("-l", "--lang", help="language: js, ts, py, c, go, rust, html")
-    n.add_argument("-d", "--dir", help="parent folder (default: defaults.output_dir)")
+    where = n.add_mutually_exclusive_group()
+    where.add_argument("-d", "--dir", help="parent folder (default: defaults.output_dir)")
+    where.add_argument("-L", "--loc", metavar="NAME", help="use a saved location (see `locations`)")
     n.add_argument("-o", "--opt", action="append", metavar="KEY=VALUE", help="preset option, e.g. -o framework=http")
     n.add_argument("--port", type=int, help="server port written into generated code")
     n.add_argument("--author")
@@ -1617,9 +2076,22 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("-f", "--force", action="store_true", help="write into a non-empty folder")
     n.add_argument("-n", "--dry-run", action="store_true", help="show what would be created")
     n.add_argument("-q", "--quiet", action="store_true")
+    n.add_argument("--no-history", action="store_true", help="do not record this project in the history")
 
     ls = sub.add_parser("presets", aliases=["list", "ls"], help="list presets")
     ls.add_argument("-l", "--lang", help="only presets for this language")
+
+    hs = sub.add_parser("history", aliases=["hist"], help="projects generated so far")
+    hs.add_argument("-n", "--limit", type=int, help="show only the newest N")
+    hs.add_argument("--missing", action="store_true", help="only projects whose folder no longer exists")
+    hs.add_argument("--prune", action="store_true", help="forget entries whose folder no longer exists")
+    hs.add_argument("--clear", action="store_true", help="forget everything (folders are not touched)")
+    hs.add_argument("--json", action="store_true")
+
+    lc = sub.add_parser("locations", aliases=["loc"], help="saved default locations")
+    lc.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="list")
+    lc.add_argument("name", nargs="?")
+    lc.add_argument("path", nargs="?", help="add: folder (default: current)")
 
     c = sub.add_parser("config", help="show / locate / create the config file")
     c.add_argument("action", nargs="?", choices=["show", "path", "init"], default="show")
@@ -1646,11 +2118,21 @@ def main(argv=None) -> int:
             return cmd_new(cfg, a)
         if a.cmd in ("presets", "list", "ls"):
             return cmd_presets(cfg, a)
+        if a.cmd in ("history", "hist"):
+            return cmd_history(cfg, a)
+        if a.cmd in ("locations", "loc"):
+            return cmd_locations(cfg, a)
     except PyxyError as exc:
         print(f"{paint('31;1', 'error:')} {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:  # e.g. `pyxyproj history | head`
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 0
     return 0
 
 
